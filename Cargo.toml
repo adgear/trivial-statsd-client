@@ -1,0 +1,8 @@
+[package]
+name = "statsd_client"
+version = "0.1.0"
+authors = ["Julian Squires <julian@cipht.net>"]
+publish = false
+
+[dependencies]
+nix = "0.8"
