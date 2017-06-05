@@ -119,7 +119,14 @@ macro_rules! statsd {
             let rate = format!("{}", $rate);
             $crate::send(&[$key, b":", count.as_bytes(), b"|c", b"|@", rate.as_bytes()])
         }
-    })
+    });
+    (gauge, $key:expr, $value:expr, $rate:expr) => ({
+        if unsafe { ::std::intrinsics::unlikely($crate::within_rate(((1.0 - $rate) * ::std::u32::MAX as f64) as u32)) } {
+            let value = format!("{}", $value);
+            let rate = format!("{}", $rate);
+            $crate::send(&[$key, b":", value.as_bytes(), b"|g", b"|@", rate.as_bytes()])
+        }
+    });
 }
 
 
