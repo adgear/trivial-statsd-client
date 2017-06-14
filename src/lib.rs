@@ -1,171 +1,309 @@
+#![cfg_attr(feature = "bench", feature(test))]
 
-#![feature(asm)]
-#![feature(const_fn)]
-#![feature(core_intrinsics)]
-#![feature(integer_atomics)]
-#![feature(libc)]
+#[cfg(feature="bench")]
+extern crate test;
 
-extern crate libc;
+extern crate time;
 
-use libc::{c_void, MSG_DONTWAIT};
-use std::io::{Cursor, Write};
 use std::net::UdpSocket;
-use std::os::unix::io::{AsRawFd, IntoRawFd};
-use std::mem;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::io::Result;
 
-const SOCKET_FD_INIT: i32 = -1;
+mod pcg32;
 
-static mut SOCKET_FD: AtomicI32 = AtomicI32::new(SOCKET_FD_INIT);
-static mut PREFIX: [u8; 576] = [0; 576];
-static mut PREFIX_LEN: usize = 0;
+/// Use a safe maximum size for UDP to prevent fragmentation.
+const MAX_UDP_PAYLOAD: usize = 576;
 
-pub fn init(address: &str, prefix: &str) -> Result<(), std::io::Error>
-{
-    let socket = UdpSocket::bind("0:0")?; // NB: CLOEXEC by default
-    socket.set_nonblocking(true)?;
-    socket.connect(address)?;
-    // so, we could protect this like log does, using a CAS on a state
-    // and so on, in the case that you choose to call `init` from a
-    // thousand different threads at once.  but, that's not a likely
-    // use-case here, so we do all the work up front, and just use the
-    // CAS to see if we won the race or not.  if we lost, free what we
-    // allocated and go home.
-    if SOCKET_FD_INIT != unsafe { SOCKET_FD.compare_and_swap(SOCKET_FD_INIT,
-                                                             socket.as_raw_fd(),
-                                                             Ordering::SeqCst) } {
-        return Ok(())
-    }
-    unsafe {
-        for (i,c) in prefix.bytes().enumerate() {
-            PREFIX[i] = c;
-        }
-        PREFIX_LEN = prefix.len();
-        if PREFIX[PREFIX_LEN-1] != b'.' {
-            PREFIX[PREFIX_LEN] = b'.';
-            PREFIX_LEN += 1;
+pub const FULL_SAMPLING_RATE: f64 = 1.0;
+
+pub trait SendStats: Sized {
+    fn send_stats(&self, str: String);
+}
+
+/// Real implementation, send a UDP packet for every stat
+impl SendStats for UdpSocket {
+    fn send_stats(&self, str: String) {
+        match self.send(str.as_bytes()) {
+            Ok(_) => {}, // TODO count packets sent for batch reporting
+            _ => {}// TODO count send errors for batch reporting
         }
     }
-    socket.into_raw_fd();       // so this doesn't get closed
-    // XXX, that's technically a leaked fd; by design, basically.
-    Ok(())
 }
 
-#[doc(hidden)]
-pub fn send(strings: &[&[u8]]) {
-    // ideally we'd construct an iov here
-    let fd = unsafe { SOCKET_FD.load(Ordering::Relaxed) };
-    if SOCKET_FD_INIT == fd { return }
-    let mut buf: [u8; 576];
-    buf = unsafe { mem::uninitialized() };
-    let len = {
-        let mut cursor = Cursor::new(&mut buf[..]);
-        let _ = cursor.write_all(unsafe { &PREFIX[..PREFIX_LEN] });
-        for s in strings { let _ = cursor.write_all(s); }
-        cursor.position() as usize
-    };
-    unsafe {
-        libc::send(fd, buf.as_ptr() as *mut c_void, len, MSG_DONTWAIT);
+/// A client to send application metrics to a statsd server over UDP.
+/// Multiple instances may be required if different sampling rates or prefix a required within the same application.
+pub struct StatsdOutlet<S: SendStats> {
+    sender: S,
+    prefix: String,
+    int_rate: u32,
+    str_rate: String
+}
+
+pub type StatsdClient = StatsdOutlet<UdpSocket>;
+
+/// A point in time from which elapsed time can be determined
+pub struct StartTime (u64);
+
+impl StartTime {
+    /// The number of milliseconds elapsed between now and this StartTime
+    fn elapsed_ms(self) -> u64 {
+        (time::precise_time_ns() - self.0) / 1_000_000
     }
 }
 
-use std::cell::RefCell;
+impl<S: SendStats> StatsdOutlet<S> {
 
-#[cfg(target_arch = "x86_64")]
-fn rdtsc() -> u64 {
-    let s: u32;
-    let t: u32;
-    unsafe { asm!("rdtsc" : "={edx}"(s), "={eax}"(t) ::) }
-    ((s as u64) << 32) | (t as u64)
-}
-
-fn seed() -> u64 {
-    let seed = 5573589319906701683_u64;
-    let seed = seed.wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407)
-        .wrapping_add(rdtsc());
-    seed.wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407)
-}
-
-fn pcg32() -> u32 {
-    thread_local! {
-        static PCG32_STATE: RefCell<u64> = RefCell::new(seed());
+    /// Create a new `StatsdClient` sending packets to the specified `address`.
+    /// Sent metric keys will be prepended with `prefix`.
+    /// Subsampling is performed according to `float_rate` where
+    /// - 1.0 is full sampling and
+    /// - 0.0 means _no_ samples will be taken
+    /// See crate method `to_int_rate` for more details and a nice table
+    pub fn new(address: &str, prefix_str: &str, float_rate: f64) -> Result<StatsdClient> {
+        let udp_socket = UdpSocket::bind("0.0.0.0:0")?; // NB: CLOEXEC by default
+        udp_socket.set_nonblocking(true)?;
+        udp_socket.connect(address)?;
+        StatsdOutlet::outlet(udp_socket, prefix_str, float_rate)
     }
 
-    PCG32_STATE.with(|state| {
-        let oldstate: u64 = *state.borrow();
-        // XXX could generate the increment from the thread ID
-        *state.borrow_mut() = oldstate.wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((((oldstate >> 18) ^ oldstate) >> 27) as u32)
-            .rotate_right((oldstate >> 59) as u32)
-    })
+    /// Create a new `StatsdClient` sending packets to the specified `address`.
+    /// Sent metric keys will be prepended with `prefix`.
+    /// Subsampling is performed according to `float_rate` where
+    /// - 1.0 is full sampling and
+    /// - 0.0 means _no_ samples will be taken
+    /// See crate method `to_int_rate` for more details and a nice table
+    fn outlet(sender: S, prefix_str: &str, float_rate: f64) -> Result<StatsdOutlet<S>> {
+        assert!(float_rate <= 1.0 && float_rate >= 0.0);
+        let prefix = prefix_str.to_string();
+        Ok(StatsdOutlet {
+            sender,
+            prefix,
+            int_rate: to_int_rate(float_rate),
+            str_rate: float_rate.to_string()
+        })
+    }
+
+    /// Report to statsd a count of items.
+    pub fn count(&self, key: &str, value: u64) {
+        if accept_sample(self.int_rate)  {
+            let count = &value.to_string();
+            self.send( &[key, ":", count, "|c|@", &self.str_rate] )
+        }
+    }
+
+    /// Report to statsd a non-cumulative (instant) count of items.
+    pub fn gauge(&self, key: &str, value: u64) {
+        if accept_sample(self.int_rate)  {
+            let count = &value.to_string();
+            self.send( &[key, ":", count, "|g|@", &self.str_rate] )
+        }
+    }
+
+    /// Report to statsd a time interval of items.
+    pub fn time_interval_ms(&self, key: &str, interval_ms: u64) {
+        if accept_sample(self.int_rate)  {
+            self.send_time_ms(key, interval_ms);
+        }
+    }
+
+    /// Query current time to use eventually with `stop_time()`
+    pub fn start_time(&self) -> StartTime {
+        StartTime( time::precise_time_ns() )
+    }
+
+    /// An efficient timer that skips querying for stop time if sample will not be collected.
+    /// Caveat : Random sampling overhead of a few ns will be included in any reported time interval.
+    pub fn stop_time(&self, key: &str, start_time: StartTime) {
+        if accept_sample(self.int_rate)  {
+            self.send_time_ms(key, start_time.elapsed_ms());
+        }
+    }
+
+    fn send_time_ms(&self, key: &str, interval_ms: u64) {
+        let value = &interval_ms.to_string();
+        self.send( &[key, ":", value, "|ms|@", &self.str_rate] )
+    }
+
+    /// Concatenate text parts into a single buffer and send it over UDP
+    fn send(&self, strings: &[&str]) {
+        let mut str = String::with_capacity(MAX_UDP_PAYLOAD);
+        str.push_str(&self.prefix);
+        for s in strings { str.push_str(s); }
+        str.push_str(&self.str_rate);
+        self.sender.send_stats(str)
+    }
+
 }
 
-pub fn within_rate(r: u32) -> bool {
-    pcg32() > r
+/// Convert a floating point sampling rate to an integer so that a fast integer RNG can be used
+/// Float rate range is between 1.0 (send 100% of the samples) and 0.0 (_no_ samples taken)
+/// .    | float rate | int rate | percentage
+/// ---- | ---------- | -------- | ----
+/// all  | 1.0        | 0x0      | 100%
+/// none | 0.0        | 0xFFFFFFFF | 0%
+fn to_int_rate(float_rate: f64) -> u32 {
+    assert!(float_rate <= 1.0 && float_rate >= 0.0);
+    ((1.0 - float_rate) * ::std::u32::MAX as f64) as u32
 }
 
+fn accept_sample(int_rate: u32) -> bool {
+    pcg32::random() > int_rate
+}
 
-// XXX we need to redo this as a syntax extension that stringifies all
-// the constant arguments so we don't need to format them.  This is
-// particularly important for rate.
+/// A convenience macro to wrap a block or an expression with a start / stop timer.
+/// Elapsed time is sent to the supplied statsd client after the computation has been performed.
+/// Expression result (if any) is transparently returned.
 #[macro_export]
-macro_rules! statsd {
-    (increment, $key:expr, $count:expr, $rate:expr) => ({
-        if unsafe { ::std::intrinsics::unlikely($crate::within_rate(((1.0 - $rate) * ::std::u32::MAX as f64) as u32)) } {
-            let count = format!("{}", $count);
-            let rate = format!("{}", $rate);
-            $crate::send(&[$key, b":", count.as_bytes(), b"|c", b"|@", rate.as_bytes()])
-        }
-    });
-    (gauge, $key:expr, $value:expr, $rate:expr) => ({
-        if unsafe { ::std::intrinsics::unlikely($crate::within_rate(((1.0 - $rate) * ::std::u32::MAX as f64) as u32)) } {
-            let value = format!("{}", $value);
-            let rate = format!("{}", $rate);
-            $crate::send(&[$key, b":", value.as_bytes(), b"|g", b"|@", rate.as_bytes()])
-        }
-    });
-    (timing, $key:expr, $value:expr, $rate:expr) => ({
-        if unsafe { ::std::intrinsics::unlikely($crate::within_rate(((1.0 - $rate) * ::std::u32::MAX as f64) as u32)) } {
-            let value = format!("{}", $value);
-            let rate = format!("{}", $rate);
-            $crate::send(&[$key, b":", value.as_bytes(), b"|ms", b"|@", rate.as_bytes()])
-        }
-    });
+macro_rules! time {
+    ($client: expr, $key: expr, $body: block) => (
+        let start_time = $client.start_time();
+        $body
+        $client.stop_time($key, start_time);
+    );
 }
 
 
-#[test]
-fn basics() {
-    const STATSD_SAMPLING_RATE: f64 = 0.5;
-    init("localhost:8125", "foo.bar").unwrap();
-    for _ in 0..10 {
-        statsd!(increment, b"boring", 1, STATSD_SAMPLING_RATE);
+/// Integrated testing with a live statsd server can be performed according to the instructions in the README.
+#[cfg(test)]
+mod tests {
+
+    use pcg32;
+    use super::StatsdOutlet;
+    use std::cell::RefCell;
+
+    impl super::SendStats for RefCell<Vec<String>> {
+        fn send_stats(&self, str: String) {
+            self.borrow_mut().push(str);
+        }
+    }
+
+    fn test_client() -> StatsdOutlet<RefCell<Vec<String>>> {
+        StatsdOutlet::<RefCell<Vec<String>>>::outlet(RefCell::new(Vec::new()), "", super::FULL_SAMPLING_RATE).unwrap()
+    }
+
+    #[test]
+    fn test_count() {
+        let statsd = test_client();
+        statsd.count("bouring", 22);
+        let str = statsd.sender.borrow_mut().pop();
+        assert_eq!(str.unwrap(), "bouring:22|c|@11")
+    }
+
+    #[test]
+    fn test_gauge() {
+        let statsd = test_client();
+        statsd.gauge("bearing", 33);
+        let str = statsd.sender.borrow_mut().pop();
+        assert_eq!(str.unwrap(), "bearing:33|g|@11")
+    }
+
+    #[test]
+    fn test_time() {
+        let statsd = test_client();
+        statsd.time_interval_ms("barry", 44);
+        let str = statsd.sender.borrow_mut().pop();
+        assert_eq!(str.unwrap(), "barry:44|ms|@11")
+    }
+
+    #[test]
+    fn test_time_macro() {
+        let statsd = test_client();
+        time!(statsd, "berry", {
+            let mut sum: i64 = 1;
+            for i in 0..100_000 {
+                sum += if i % 2 == 0  {i} else {-i};
+            };
+            println!("{}", sum);
+        });
+        let str = statsd.sender.borrow_mut().pop();
+        assert!(str.unwrap().starts_with("berry"))
+    }
+
+    #[test]
+    fn basic_behavior_of_pcg32() {
+        let mut v = Vec::new();
+        for _ in 0..100 { v.push(pcg32::random()) }
+        v.sort();
+        for w in v.windows(2) { assert_ne!(w[0], w[1]) }
+    }
+
+    fn validate_rate_distribution(rate: f64) {
+        let variance = rate * (1.0 - rate); // variance of the Bernoulli distribution
+        let sampling = super::to_int_rate(rate);
+        let n: u64 = 10000;
+
+        let observed = (0..n).filter(|_| super::accept_sample(sampling)).count();
+        let f = n as f64;
+        let expected = ((f * rate) - (f * variance),
+                        (f * rate) + (f * variance));
+        println!("rate: {}, variance: {}, observed: {}; should be within {:?}", rate, variance, observed as f64, expected);
+        println!("expected.0: {}, expected.1: {}", expected.0, expected.1);
+
+        assert!(expected.0 < observed as f64);
+        assert!(expected.1 > observed as f64);
+    }
+
+    #[test]
+    fn test_sampling_low_rate() {
+        validate_rate_distribution(0.01);
+    }
+
+    #[test]
+    fn test_sampling_mid_rate() {
+        validate_rate_distribution(0.5);
+    }
+
+    #[test]
+    fn test_sampling_hi_rate() {
+        validate_rate_distribution(0.99);
     }
 }
 
 
-#[test]
-fn basic_behavior_of_pcg32() {
-    let mut v = Vec::new();
-    for _ in 0..100 { v.push(pcg32()) }
-    v.sort();
-    for w in v.windows(2) { assert_ne!(w[0], w[1]) }
-}
+/// Run benchmarks with `cargo +nightly bench --features bench`
+/// Rough results on T460S, nightly 1.19.0:
+/// - PCG32 random sampling go/no-go takes ~6ns/measure
+/// - Assembling the string to send takes ~173ns/measure (measured with udp_socket.send() commented out)
+/// - Sending the packet takes ~4000ns/measure
+///
+/// Setting #[cold] on send() method had no apparent effect.
+///
+/// The moral of the story is : if you need to spend less time doing metrics, send less packets.
+/// The first thing to optimize would be to send multiple measures per packet.
+/// Also, sending asynchronously would minimize work thread jitter which might be desirable in interactive apps.
+/// If performance is still a problem (really?), maybe attack packet formatting?
+#[cfg(feature="bench")]
+mod bench {
 
+    use test::Bencher;
 
-#[test]
-fn test_sampling() {
-    let rate = 0.01;
-    let variance = rate * (1.0 - rate); // variance of the Bernoulli distribution
-    let n = 10000_f64;
-    let observed = (0..n as u64)
-        .fold(0, |sum, _| sum + if within_rate(((1.0 - rate) * std::u32::MAX as f64) as u32) {1} else {0}) as f64;
-    let expected = ((n*rate)-(n*variance),
-                    (n*rate)+(n*variance));
-    println!("observed: {}; should be within {:?}", observed, expected);
-    assert!(expected.0 < observed);
-    assert!(expected.1 > observed);
+    #[bench]
+    fn time_bench_ten_percent(b: &mut Bencher) {
+        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 0.1).unwrap();
+        b.iter(|| statsd.time_interval_ms("barry", 44));
+    }
+
+    #[bench]
+    fn time_bench_one_percent(b: &mut Bencher) {
+        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 0.01).unwrap();
+        b.iter(|| statsd.time_interval_ms("barry", 44));
+    }
+
+    #[bench]
+    fn time_bench_point_one_percent(b: &mut Bencher) {
+        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 0.001).unwrap();
+        b.iter(|| statsd.time_interval_ms("barry", 44));
+    }
+
+    #[bench]
+    fn time_bench_full_sampling(b: &mut Bencher) {
+        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 1.0).unwrap();
+        b.iter(|| statsd.time_interval_ms("barry", 44));
+    }
+
+    #[bench]
+    fn time_bench_never(b: &mut Bencher) {
+        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 0.0).unwrap();
+        b.iter(|| statsd.time_interval_ms("barry", 44));
+    }
+
 }
