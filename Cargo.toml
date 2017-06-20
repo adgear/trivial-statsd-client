@@ -1,8 +1,11 @@
 [package]
 name = "statsd_client"
-version = "0.1.1"
-authors = ["Julian Squires <julian@cipht.net>"]
+version = "0.2.0"
+authors = ["Julian Squires <julian@cipht.net>", "Francis Lalonde <francis.lalonde@adgear.com>"]
 publish = false
 
 [dependencies]
-nix = "0.8"
+time = "0.1"
+
+[features]
+bench = []
