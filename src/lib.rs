@@ -35,10 +35,27 @@ pub struct StatsdOutlet<S: SendStats> {
     sender: S,
     prefix: String,
     int_rate: u32,
-    str_rate: String
+    gauge_suffix: String,
+    count_suffix: String,
+    time_suffix: String
 }
 
 pub type StatsdClient = StatsdOutlet<UdpSocket>;
+
+impl StatsdClient {
+    /// Create a new `StatsdClient` sending packets to the specified `address`.
+    /// Sent metric keys will be prepended with `prefix`.
+    /// Subsampling is performed according to `float_rate` where
+    /// - 1.0 is full sampling and
+    /// - 0.0 means _no_ samples will be taken
+    /// See crate method `to_int_rate` for more details and a nice table
+    pub fn new(address: &str, prefix_str: &str, float_rate: f64) -> Result<StatsdClient> {
+        let udp_socket = UdpSocket::bind("0.0.0.0:0")?; // NB: CLOEXEC by default
+        udp_socket.set_nonblocking(true)?;
+        udp_socket.connect(address)?;
+        StatsdOutlet::outlet(udp_socket, prefix_str, float_rate)
+    }
+}
 
 /// A point in time from which elapsed time can be determined
 pub struct StartTime (u64);
@@ -58,27 +75,17 @@ impl<S: SendStats> StatsdOutlet<S> {
     /// - 1.0 is full sampling and
     /// - 0.0 means _no_ samples will be taken
     /// See crate method `to_int_rate` for more details and a nice table
-    pub fn new(address: &str, prefix_str: &str, float_rate: f64) -> Result<StatsdClient> {
-        let udp_socket = UdpSocket::bind("0.0.0.0:0")?; // NB: CLOEXEC by default
-        udp_socket.set_nonblocking(true)?;
-        udp_socket.connect(address)?;
-        StatsdOutlet::outlet(udp_socket, prefix_str, float_rate)
-    }
-
-    /// Create a new `StatsdClient` sending packets to the specified `address`.
-    /// Sent metric keys will be prepended with `prefix`.
-    /// Subsampling is performed according to `float_rate` where
-    /// - 1.0 is full sampling and
-    /// - 0.0 means _no_ samples will be taken
-    /// See crate method `to_int_rate` for more details and a nice table
     fn outlet(sender: S, prefix_str: &str, float_rate: f64) -> Result<StatsdOutlet<S>> {
         assert!(float_rate <= 1.0 && float_rate >= 0.0);
         let prefix = prefix_str.to_string();
+        let rate_suffix = if float_rate < 1.0 { format!("|@{}", float_rate)} else { "".to_string() };
         Ok(StatsdOutlet {
             sender,
             prefix,
             int_rate: to_int_rate(float_rate),
-            str_rate: float_rate.to_string()
+            time_suffix: format!("|ms{}", rate_suffix),
+            gauge_suffix: format!("|g{}", rate_suffix),
+            count_suffix: format!("|c{}", rate_suffix)
         })
     }
 
@@ -86,7 +93,7 @@ impl<S: SendStats> StatsdOutlet<S> {
     pub fn count(&self, key: &str, value: u64) {
         if accept_sample(self.int_rate)  {
             let count = &value.to_string();
-            self.send( &[key, ":", count, "|c|@", &self.str_rate] )
+            self.send( &[key, ":", count, &self.count_suffix] )
         }
     }
 
@@ -94,7 +101,7 @@ impl<S: SendStats> StatsdOutlet<S> {
     pub fn gauge(&self, key: &str, value: u64) {
         if accept_sample(self.int_rate)  {
             let count = &value.to_string();
-            self.send( &[key, ":", count, "|g|@", &self.str_rate] )
+            self.send( &[key, ":", count, &self.gauge_suffix] )
         }
     }
 
@@ -120,7 +127,7 @@ impl<S: SendStats> StatsdOutlet<S> {
 
     fn send_time_ms(&self, key: &str, interval_ms: u64) {
         let value = &interval_ms.to_string();
-        self.send( &[key, ":", value, "|ms|@", &self.str_rate] )
+        self.send( &[key, ":", value, &self.time_suffix] )
     }
 
     /// Concatenate text parts into a single buffer and send it over UDP
@@ -128,7 +135,6 @@ impl<S: SendStats> StatsdOutlet<S> {
         let mut str = String::with_capacity(MAX_UDP_PAYLOAD);
         str.push_str(&self.prefix);
         for s in strings { str.push_str(s); }
-        str.push_str(&self.str_rate);
         self.sender.send_stats(str)
     }
 
@@ -177,15 +183,19 @@ mod tests {
     }
 
     fn test_client() -> StatsdOutlet<RefCell<Vec<String>>> {
-        StatsdOutlet::<RefCell<Vec<String>>>::outlet(RefCell::new(Vec::new()), "", super::FULL_SAMPLING_RATE).unwrap()
+        StatsdOutlet::outlet(RefCell::new(Vec::new()), "", super::FULL_SAMPLING_RATE).unwrap()
+    }
+
+    fn test_sampling_client() -> StatsdOutlet<RefCell<Vec<String>>> {
+        StatsdOutlet::outlet(RefCell::new(Vec::new()), "", 0.999).unwrap()
     }
 
     #[test]
     fn test_count() {
-        let statsd = test_client();
+        let statsd = test_client(); 
         statsd.count("bouring", 22);
         let str = statsd.sender.borrow_mut().pop();
-        assert_eq!(str.unwrap(), "bouring:22|c|@11")
+        assert_eq!(str.unwrap(), "bouring:22|c")
     }
 
     #[test]
@@ -193,7 +203,7 @@ mod tests {
         let statsd = test_client();
         statsd.gauge("bearing", 33);
         let str = statsd.sender.borrow_mut().pop();
-        assert_eq!(str.unwrap(), "bearing:33|g|@11")
+        assert_eq!(str.unwrap(), "bearing:33|g")
     }
 
     #[test]
@@ -201,7 +211,31 @@ mod tests {
         let statsd = test_client();
         statsd.time_interval_ms("barry", 44);
         let str = statsd.sender.borrow_mut().pop();
-        assert_eq!(str.unwrap(), "barry:44|ms|@11")
+        assert_eq!(str.unwrap(), "barry:44|ms")
+    }
+
+    #[test]
+    fn test_sampling_count() {
+        let statsd = test_sampling_client();
+        statsd.count("bouring", 22);
+        let str = statsd.sender.borrow_mut().pop();
+        assert_eq!(str.unwrap(), "bouring:22|c|@0.999")
+    }
+
+    #[test]
+    fn test_smapling_gauge() {
+        let statsd = test_sampling_client();
+        statsd.gauge("bearing", 33);
+        let str = statsd.sender.borrow_mut().pop();
+        assert_eq!(str.unwrap(), "bearing:33|g|@0.999")
+    }
+
+    #[test]
+    fn test_sampling_time() {
+        let statsd = test_sampling_client();
+        statsd.time_interval_ms("barry", 44);
+        let str = statsd.sender.borrow_mut().pop();
+        assert_eq!(str.unwrap(), "barry:44|ms|@0.999")
     }
 
     #[test]
@@ -278,31 +312,31 @@ mod bench {
 
     #[bench]
     fn time_bench_ten_percent(b: &mut Bencher) {
-        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 0.1).unwrap();
+        let statsd = super::StatsdClient::new("localhost:8125", "a.b.c", 0.1).unwrap();
         b.iter(|| statsd.time_interval_ms("barry", 44));
     }
 
     #[bench]
     fn time_bench_one_percent(b: &mut Bencher) {
-        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 0.01).unwrap();
+        let statsd = super::StatsdClient::new("localhost:8125", "a.b.c", 0.01).unwrap();
         b.iter(|| statsd.time_interval_ms("barry", 44));
     }
 
     #[bench]
     fn time_bench_point_one_percent(b: &mut Bencher) {
-        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 0.001).unwrap();
+        let statsd = super::StatsdClient::new("localhost:8125", "a.b.c", 0.001).unwrap();
         b.iter(|| statsd.time_interval_ms("barry", 44));
     }
 
     #[bench]
     fn time_bench_full_sampling(b: &mut Bencher) {
-        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 1.0).unwrap();
+        let statsd = super::StatsdClient::new("localhost:8125", "a.b.c", 1.0).unwrap();
         b.iter(|| statsd.time_interval_ms("barry", 44));
     }
 
     #[bench]
     fn time_bench_never(b: &mut Bencher) {
-        let statsd = super::StatsdOutlet::new("localhost:8125", "a.b.c", 0.0).unwrap();
+        let statsd = super::StatsdClient::new("localhost:8125", "a.b.c", 0.0).unwrap();
         b.iter(|| statsd.time_interval_ms("barry", 44));
     }
 

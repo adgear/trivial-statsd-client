@@ -1,6 +1,6 @@
 [package]
 name = "statsd_client"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Julian Squires <julian@cipht.net>", "Francis Lalonde <francis.lalonde@adgear.com>"]
 publish = false
 
